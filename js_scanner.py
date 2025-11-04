@@ -1,262 +1,234 @@
-import requests
+#
+# JS Scanner: A Python script to automate URL gathering and scan JavaScript files
+#             for hardcoded secrets, tokens, and keys.
+#
+# Dependencies: requests, gau (for the -d option)
+#
 import re
+import argparse
 import sys
-import time
-import subprocess # Added subprocess for running external commands
-from typing import Dict, Optional, List
+import requests
+import subprocess
+from urllib.parse import urlparse
 
 # --- Configuration ---
-# File containing one URL per line (Used as default if no argument is passed)
-URL_FILE = "js_urls.txt"
-# Maximum number of lines/characters to print around a match for context
-CONTEXT_CHARS = 50
-# User-Agent to use for requests (helps avoid being blocked)
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-# A comprehensive dictionary of regular expressions to search for sensitive data.
-# The keys are descriptive names, and the values are the regex patterns.
-# NOTE: These patterns are heuristic and may produce false positives.
-PATTERNS: Dict[str, str] = {
-    # Generic Tokens/Keys (look for common keywords followed by key-like characters)
-    "Generic API Key/Secret": r"(secret|key|token|password|auth|client_id|client_secret)[\s\"'=]{0,5}([a-zA-Z0-9_\-./!@#$%^&*+=]{16,})",
+# Comprehensive list of regex patterns for finding secrets.
+# Pattern names are used in the final report.
+PATTERNS = {
+    # Generic Tokens/Keys
+    "Generic API Key": r'(?:api|token|key|secret|password|passwd|auth)[\s:=]*["\']?([a-zA-Z0-9_-]{16,64})["\']?',
+    "JWT": r'ey[A-Za-z0-9-_]{10,}\.[A-Za-z0-9-_]{10,}\.[A-Za-z0-9-_]{10,}',
+    "Password/Credential": r'(?:password|passwd|pwd|pass)[\s:=]*["\']?([a-zA-Z0-9!@#$%^&*()_+]{8,})["\']?',
     
-    # AWS Access Key IDs (AKIA, ASIA, etc.)
-    "AWS Access Key ID": r"(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16,20}",
-    
-    # Firebase/Google API Key
-    "Firebase/GCP API Key": r"AIza[0-9A-Za-z\-_]{35}",
-    
-    # Private SSH Key Header
-    "Private SSH Key Header": r"-----BEGIN\s(?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----",
+    # Cloud Providers
+    "AWS Access Key ID": r'(A3T[A-Z0-9]|AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASTU)[\w]{16,}',
+    "AWS Secret Access Key": r'(?i)aws_secret_access_key["\']?[\s:=]*["\']?([a-zA-Z0-9+/]{40})["\']?',
+    "Azure Client Secret": r'(?i)client_secret["\']?[\s:=]*["\']?([a-zA-Z0-9-~_]{27,64})["\']?',
+    "Google API Key (AI/Maps)": r'AIza[0-9A-Za-z-_]{35}',
+    "Google OAuth Client Secret": r'(?i)client_secret["\']?[\s:=]*["\']?([0-9a-zA-Z\s\-_]{24})["\']?',
 
-    # JSON Web Token (JWT) - looks for three base64 segments
-    "JWT Token (Base64)": r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",
-    
-    # Generic Bearer Token
-    "Generic Bearer Token": r"Bearer\s[A-Za-z0-9\-\._~+/]{20,}",
-    
-    # Basic Auth in URL (user:pass@host)
-    "Basic Auth URL Segment": r"[a-zA-Z0-9_\-]+\:[a-zA-Z0-9_\-]+@\S+",
-
-    # Stripe Secret Key (sk_live_ or rk_live_)
-    "Stripe Secret Key": r"(sk_live_|rk_live_)[0-9a-zA-Z]{24,}",
-
-    # GitHub/GitLab Personal Access Tokens (often start with ghp/glp)
-    "GitHub/GitLab Token": r"(ghp_|glp_)[a-zA-Z0-9_]{36,}",
+    # Service Specific
+    "Stripe Publishable Key": r'(?:pk|sk)_(?:live|test)_[0-9a-z]{24,32}',
+    "GitHub Personal Access Token": r'(?:github|ghp|gho|ghu|ghs|ght)_[0-9a-zA-Z]{36}',
+    "Slack Token": r'xox[baprsd]-[0-9a-zA-Z]{10,48}',
+    "Twilio Auth Token": r'AC[a-z0-9]{32}',
+    "Firebase Config URL": r'(?i)firebaseUrl["\']?[\s:=]*["\']?(https://[\w-]+\.firebaseio\.com)["\']?',
+    "Sentry DSN": r'https?:\/\/[0-9a-f]{32}@sentry\.[a-z\._-]+\/[0-9]+',
 }
 
-def get_js_content(url: str, is_silent: bool) -> Optional[str]:
-    """Fetches the content of a given URL."""
+# Maximum number of characters to show around a match for context
+CONTEXT_WINDOW = 50
+
+# --- Helper Functions ---
+
+def run_gau(domain, silent=False):
+    """
+    Executes the 'gau' command on the target domain and extracts JS URLs.
+    Includes performance optimizations and filters for '.js' files in Python.
+    """
+    if not silent:
+        print(f"[*] Running gau (with --subs --threads 10) on {domain}...")
+
+    # Command to run: gau --subs --threads 10 domain.com
+    # Removed | grep to use native Python filtering for performance.
+    command = ['gau', '--subs', '--threads', '10', domain]
+
     try:
-        headers = {'User-Agent': USER_AGENT}
-        # Set a short timeout to prevent the script from hanging on bad connections
-        response = requests.get(url, headers=headers, timeout=10)
+        # Execute gau and capture output
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120  # Set a 2-minute timeout for gau execution
+        )
         
-        # Check for successful status codes
-        if response.status_code == 200:
+        # Process the output lines
+        all_urls = result.stdout.splitlines()
+        
+        # Filter URLs for .js files using native Python
+        js_urls = [url.strip() for url in all_urls if url.strip().endswith('.js')]
+        
+        if not silent:
+            print(f"[+] Found {len(js_urls)} unique JavaScript URLs.")
+        return js_urls
+
+    except subprocess.CalledProcessError as e:
+        print(f"[!] Error: 'gau' command failed with return code {e.returncode}.")
+        if "No such file or directory" in e.stderr:
+             print("[!] Suggestion: Make sure 'gau' is installed and in your system PATH.")
+        return []
+    except FileNotFoundError:
+        print("[!] Fatal Error: 'gau' tool not found. Please install it to use the -d option.")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("[!] Error: 'gau' command timed out after 120 seconds.")
+        return []
+
+def get_js_content(url, session, only_ok, silent):
+    """
+    Fetches the content of a single JavaScript file.
+    """
+    try:
+        response = session.get(url, timeout=10)
+        
+        # Print status message based on verbosity and status code
+        status_code = response.status_code
+        status_message = f"[{status_code} {response.reason}] Processing: {url}"
+
+        if not silent:
+            if status_code == 200:
+                print(f"[+] {status_message}")
+            elif not only_ok:
+                # Only print non-200 errors if not in 'only_ok' mode
+                print(f"[-] {status_message}")
+
+        if status_code == 200:
             return response.text
-        else:
-            if not is_silent:
-                print(f"[-] HTTP Error: {url} returned status code {response.status_code}")
-            return None
-            
-    except requests.exceptions.RequestException as e:
-        if not is_silent:
-            print(f"[-] Connection Error for {url}: {e}")
-        return None
-    except Exception as e:
-        if not is_silent:
-            print(f"[-] An unexpected error occurred for {url}: {e}")
         return None
 
-def scan_content(url: str, content: str) -> List[Dict[str, str]]:
-    """Scans the content using defined regex patterns and returns matches."""
+    except requests.exceptions.RequestException as e:
+        if not silent and not only_ok:
+            # Print network-level errors if not in 'only_ok' mode
+            print(f"[!] Connection Error for {url}: {e.__class__.__name__}")
+        return None
+
+def scan_content(url, content):
+    """
+    Scans the content of the file for known secret patterns.
+    Returns a list of dictionaries containing found secrets.
+    """
     found_secrets = []
-    
+
     for name, pattern in PATTERNS.items():
-        # Compile the regex once for efficiency
-        compiled_pattern = re.compile(pattern, re.IGNORECASE)
-        
-        # Find all matches in the content
-        for match in compiled_pattern.finditer(content):
+        # Using finditer for efficiency to find all matches
+        for match in re.finditer(pattern, content):
+            full_match = match.group(0)  # The entire string that matched the regex
             
-            # Get the exact match string
-            match_string = match.group(0)
+            # Use group(1) if available, otherwise use the full match.
+            # This handles patterns where the secret itself is captured in group 1.
+            secret_value = match.group(1) if len(match.groups()) > 0 else full_match
             
-            # Find context around the match
-            start_index = max(0, match.start() - CONTEXT_CHARS)
-            end_index = min(len(content), match.end() + CONTEXT_CHARS)
+            # Determine start/end indices for context window
+            start_index = max(0, match.start() - CONTEXT_WINDOW)
+            end_index = min(len(content), match.end() + CONTEXT_WINDOW)
             
-            # Highlight the match in the context
-            context_snippet = (
-                content[start_index:match.start()]
-                + " [!!! MATCH !!!] " + match_string + " [!!! END MATCH !!!] "
-                + content[match.end():end_index]
-            )
-            
+            # Extract context and clean up the secret value for display
+            context_snippet = content[start_index:end_index].strip().replace('\n', ' ').replace('\r', '')
+
+            # Heuristics: Skip common false positives if the secret is too short or generic
+            if len(secret_value) < 16 and name in ["Generic API Key", "Password/Credential"]:
+                continue 
+
             found_secrets.append({
-                "type": name,
                 "url": url,
-                "snippet": match_string,
-                "context": context_snippet.replace('\n', ' ').strip()
+                "type": name,
+                "value": secret_value,
+                "snippet": context_snippet
             })
             
     return found_secrets
 
-def run_gau(domain: str, is_silent: bool) -> List[str]:
+def print_summary(results):
     """
-    Runs the 'gau' command, filters for .js files, and returns a list of URLs.
-    Requires 'gau' and 'grep' to be installed on the system.
+    Prints the final, formatted summary of all found secrets.
     """
-    # Use '--subs' flag for gau to include subdomains, matching the functionality of popular tools.
-    command = f"gau --subs {domain} | grep '\\.js$'"
-    
-    if not is_silent:
-        print(f"[INFO] Running external command to fetch URLs: {command}")
+    if not results:
+        print("\n[+] Scan finished. No secrets found.")
+        return
 
-    try:
-        # Use shell=True to handle the pipe (|) and run the command string directly
-        # capture_output=True captures stdout and stderr
-        # text=True decodes the output as a string (default is bytes)
-        process = subprocess.run(
-            command, 
-            shell=True, 
-            capture_output=True, 
-            text=True, 
-            check=False # Do not raise exception on non-zero exit (e.g., grep finds nothing)
-        )
-        
-        # Check for command failure (gau/grep not found, permission denied, etc.)
-        if process.returncode != 0 and process.stderr and "not found" in process.stderr:
-            if not is_silent:
-                print(f"\n[FATAL] Error running external command. Please ensure 'gau' and 'grep' are installed and in your PATH.")
-                print(f"Subprocess Error Output:\n{process.stderr.strip()}")
-            return []
-            
-        # Extract and clean up the URLs from stdout
-        urls = [line.strip() for line in process.stdout.splitlines() if line.strip()]
-        return urls
+    print(f"\n{'='*80}")
+    print(f"| SECRETS FOUND: {len(results)} potential credentials/keys")
+    print(f"{'='*80}")
 
-    except FileNotFoundError:
-        if not is_silent:
-            print("\n[FATAL] Python could not find the necessary command utilities ('sh' or underlying tools).")
-        return []
-    except Exception as e:
-        if not is_silent:
-            print(f"\n[FATAL] An unexpected error occurred during URL fetching: {e}")
-        return []
+    for i, secret in enumerate(results):
+        print(f"\n--- MATCH {i+1}: {secret['type']} ---")
+        print(f"URL:     {secret['url']}")
+        print(f"Value:   {secret['value']}")
+        print(f"Context: {secret['snippet']}")
+
+# --- Main Execution ---
 
 def main():
-    """Main function to orchestrate the scanning process, now handling command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="JavaScript Scanner for Hardcoded Secrets. Use either -l or -d.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
     
-    # Initialize variables
-    input_file_path = URL_FILE
-    target_domain = None
-    is_silent = False
-    mode = 'default_file' # 'default_file', 'file', or 'domain'
-    
-    # 1. Check for silent flag (-s) first
-    if '-s' in sys.argv:
-        is_silent = True
-        sys.argv.remove('-s')
+    # Argument group for input source (mutually exclusive)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('-l', '--list', help='File path containing list of JS URLs (one per line).')
+    input_group.add_argument('-d', '--domain', help='Target domain to run gau on (e.g., example.com). Requires "gau" to be installed.')
 
-    # 2. Parse remaining arguments for mode (-l or -d)
-    if '-l' in sys.argv:
-        try:
-            l_index = sys.argv.index('-l')
-            input_file_path = sys.argv[l_index + 1]
-            mode = 'file'
-        except (IndexError, ValueError):
-            if not is_silent:
-                print("Error: -l option requires a file path argument.")
-            sys.exit(1)
-            
-    elif '-d' in sys.argv:
-        try:
-            d_index = sys.argv.index('-d')
-            target_domain = sys.argv[d_index + 1]
-            mode = 'domain'
-        except (IndexError, ValueError):
-            if not is_silent:
-                print("Error: -d option requires a target domain argument (e.g., example.com).")
-            sys.exit(1)
-    
-    # 3. Handle Usage/Help message
-    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
-        print(f"Usage: python {sys.argv[0]} [-l <file_path> | -d <domain>] [-s]")
-        print("  -l <file_path> : Read URLs from a specified file (e.g., js_urls.txt).")
-        print("  -d <domain>    : Automatically run 'gau <domain> | grep .js$' to fetch URLs.")
-        print("  -s             : Silent mode (suppress all progress output, only show summary).")
-        print("Default: Reads URLs from 'js_urls.txt'.")
-        sys.exit(0)
+    # Optional flags for output control
+    parser.add_argument('-s', '--silent', action='store_true', help='Suppress all progress output; only prints the final summary of found secrets.')
+    parser.add_argument('-ok', '--only-ok', action='store_true', help='Only display processing messages for URLs that return HTTP 200 OK. Requires -s to be False.')
 
-    # 4. Get URLs based on mode
-    urls = []
-    if mode == 'domain':
-        urls = run_gau(target_domain, is_silent)
-        if not urls:
-            if not is_silent:
-                print(f"\n[INFO] 'gau' found 0 JavaScript URLs for {target_domain}. Exiting scan.")
-            sys.exit(0)
+    args = parser.parse_args()
     
-    else: # mode is 'file' or 'default_file'
-        if not is_silent:
-            print(f"--- JS Secret Scanner Initialized ---")
-            print(f"Attempting to read URLs from: {input_file_path}")
-        
+    urls_to_scan = []
+
+    if args.domain:
+        # Gather URLs using gau
+        urls_to_scan = run_gau(args.domain, args.silent)
+    elif args.list:
+        # Read URLs from file
         try:
-            with open(input_file_path, 'r') as f:
-                urls = [line.strip() for line in f if line.strip()]
+            with open(args.list, 'r') as f:
+                urls_to_scan = [line.strip() for line in f if line.strip().endswith('.js')]
+            if not args.silent:
+                print(f"[*] Loaded {len(urls_to_scan)} JavaScript URLs from {args.list}")
         except FileNotFoundError:
-            print(f"\n[FATAL] Error: The file '{input_file_path}' was not found.")
-            print("Please ensure the file path is correct.")
+            print(f"[!] Fatal Error: Input file '{args.list}' not found.")
             sys.exit(1)
 
-    if not urls and mode != 'domain':
-        print("\n[INFO] No URLs found in the input file. Exiting scan.")
+    if not urls_to_scan:
+        if not args.silent:
+            print("[!] No valid JavaScript URLs found to scan. Exiting.")
         sys.exit(0)
-        
-    if not is_silent:
-        print(f"Found {len(urls)} URLs to scan. Starting scan...\n")
 
-    # 5. Begin Scanning Process
+    # Use a single session for connection pooling and efficiency
+    session = requests.Session()
     all_results = []
-    
-    for i, url in enumerate(urls, 1):
-        if not is_silent:
-            print(f"[{i}/{len(urls)}] Processing: {url}")
-        
-        content = get_js_content(url, is_silent)
+    total_urls = len(urls_to_scan)
+
+    for i, url in enumerate(urls_to_scan, 1):
+        if not args.silent:
+            # Print progress indicator if not silent
+            sys.stdout.write(f"\r[{i}/{total_urls}] ")
+            sys.stdout.flush()
+
+        content = get_js_content(url, session, args.only_ok, args.silent)
         
         if content:
-            results = scan_content(url, content)
-            if results:
-                if not is_silent:
-                    print(f"[SUCCESS] Found {len(results)} potential secret(s) in {url}")
-                all_results.extend(results)
-            # Be polite to the server
-            time.sleep(0.5)
+            secrets = scan_content(url, content)
+            if secrets:
+                all_results.extend(secrets)
 
-    # 6. Summary Output
-    # The summary block should always run, regardless of is_silent
-    print("\n\n#################################################")
-    print("             SCANNING SUMMARY")
-    print("#################################################\n")
-
-    if all_results:
-        print(f"TOTAL POTENTIAL SECRETS FOUND: {len(all_results)}\n")
-        
-        for result in all_results:
-            print("-" * 50)
-            print(f"Type:      {result['type']}")
-            print(f"URL:       {result['url']}")
-            print(f"Snippet:   {result['snippet']}")
-            print(f"Context:   {result['context'][:1000]}...") # Truncate context for cleaner output
-            print("-" * 50)
-    else:
-        print("No potential secrets or juicy info found based on defined patterns.")
-
+    # Final output is always the summary, unless fully silent mode (-s) is active and nothing was found
+    if not args.silent or all_results:
+        print_summary(all_results)
+    
 if __name__ == "__main__":
-    # Ensure you have the 'requests' library installed: pip install requests
-    # If using the -d option, ensure 'gau' and 'grep' are installed and in your system PATH.
     main()
